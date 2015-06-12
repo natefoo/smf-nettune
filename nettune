@@ -1,0 +1,199 @@
+#!/bin/ksh
+#
+# Copyright (c) 2015 Nathan Coraor <nate@coraor.org>
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+
+PRESEED="/opt/custom/etc/nettune_preseed.conf"
+
+
+. /lib/svc/share/smf_include.sh
+
+fmri="${SMF_FMRI%:*}"
+
+[ -f "/usr/sbin/ipadm" ] && tool="ipadm" || tool="ndd"
+
+fatal () {
+    echo "Error: $@" 2>&1 | smf_console
+    exit $SMF_EXIT_ERR_FATAL
+}
+
+create_pg () {
+    if ! /usr/bin/svcprop -qp $1 $fmri; then
+        /usr/sbin/svccfg -s $fmri addpg $1 $2 || fatal "creating property group failed: $1"
+    fi
+}
+
+U_to_underscore () {
+    [ `echo $1 | cut -c1` = "U" ] && echo "_`echo $1 | cut -c2-`" || echo $1
+}
+
+get_propval () {
+    dev=$1
+    property=$2
+
+    case $tool in
+        ipadm)
+            property=`U_to_underscore $property`
+            /usr/sbin/ipadm show-prop -c -o current -p $property $dev || fatal "getting $tool value of $dev property failed: $property"
+            ;;
+        ndd)
+            /usr/sbin/ndd $dev $property || fatal "getting $tool value of $dev property failed: $property"
+            ;;
+    esac
+}
+
+set_propval () {
+    dev=$1
+    property=$2
+    propval=$3
+
+    case $tool in
+        ipadm)
+            property=`U_to_underscore $property`
+            /usr/sbin/ipadm set-prop -p $property=$propval $dev || fatal "setting $tool value of $dev property failed: $property = $propval"
+            ;;
+        ndd)
+            /usr/sbin/ndd -set $dev $property $propval || fatal "setting $tool value of $dev property failed: $property = $propval"
+            ;;
+    esac
+}
+
+reset_propval () {
+    dev=$1
+    property=$2
+
+    case $tool in
+        ipadm)
+            property=`U_to_underscore $property`
+            /usr/sbin/ipadm reset-prop -p $property $dev || fatal "resetting $tool property of $dev failed: $property"
+            ;;
+        ndd)
+            set_propval $1 $2 $3
+            ;;
+    esac
+}
+
+preseed_properties () {
+    if [ -f "$PRESEED" ]; then
+        while read pg property proptype propval; do
+            create_pg $pg application
+            if ! /usr/bin/svcprop -qp $pg/$property $fmri; then
+                /usr/sbin/svccfg -s $fmri setprop $pg/$property = $proptype: $propval || fatal "unable to preseed $proptype value: $pg/$property = $propval"
+                dirty=1
+            fi
+        done <$PRESEED
+        # i hope this is possible while the start method is running
+        [ $dirty ] && /usr/sbin/svcadm refresh $fmri
+    fi
+}
+
+start_method () {
+    # args
+    defaults_pg=$1
+    property_group=$2
+    dev=$3
+    property=$4
+    proptype=$5
+    propval=$6
+
+    cur_propval=`get_propval $dev $property`
+    # nothing to change
+    [ "$propval" -eq "$cur_propval" ] && return
+
+    # if no default set, do it now
+    if ! /usr/bin/svcprop -qp $defaults_pg/$property $fmri; then
+        /usr/sbin/svccfg -s $fmri setprop $defaults_pg/$property = $proptype: $cur_propval || fatal "unable to store default value: $property = $def_propval"
+    fi
+
+    # set it
+    set_propval $dev $property $propval
+}
+
+stop_method () {
+    # args
+    defaults_pg=$1
+    property_group=$2
+    dev=$3
+    property=$4
+
+    cur_propval=`get_propval $dev $property`
+    def_propval=`/usr/bin/svcprop -p $defaults_pg/$property $fmri`
+    # def_propval will not exist if the default = desired when starting
+    # nothing to change
+    [ $? -eq 1 -o "$def_propval" -eq "$cur_propval" ] && return
+
+    # set it
+    reset_propval $dev $property $def_propval || fatal "unable to restore default value: $property = $def_propval"
+}
+
+main () {
+    /usr/sbin/svccfg -s $fmri listpg | while read property_group property_group_type
+    do
+        [ "$property_group_type" != "application" ] && continue
+        # create a pg for defaults (for stop method)
+        defaults_pg="${property_group}_defaults"
+        [ $1 = 'start' ] && create_pg $defaults_pg appdefaults
+        # won't work for anything with an underscore in it, but hardly any devices
+        # have one, and they're not tunable.
+        case $tool in
+            ipadm)
+                dev=$property_group
+                ;;
+            ndd)
+                dev="/dev/$property_group"
+                ;;
+        esac
+        /usr/bin/svcprop -p $property_group $fmri | while read line
+        do
+            # collect prop info
+            set -A propstuff $line
+            echo ${propstuff[0]} | IFS='/' read pg property
+            proptype=${propstuff[1]}
+            propval=${propstuff[2]}
+            case "$1" in
+                start)
+                    start_method $defaults_pg $property_group $dev $property $proptype $propval
+                    ;;
+                stop)
+                    stop_method $defaults_pg $property_group $dev $property
+                    ;;
+            esac
+        done
+        # update the running snapshot
+        /usr/sbin/svcadm refresh $fmri
+    done
+}
+
+case "$1" in
+    start|stop)
+        # preseed any values configured in the preseed file
+        preseed_properties
+        main $1
+        ;;
+    stop)
+        main $1
+        ;;
+    *)
+        echo "usage: $0 start|stop"
+        exit $SMF_EXIT_ERR_FATAL
+        ;;
+esac
+
+exit $SMF_EXIT_OK
